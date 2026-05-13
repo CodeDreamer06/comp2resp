@@ -32,26 +32,24 @@ fn config(base_url: String) -> Config {
 async fn proxies_non_streaming_request() {
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v1/responses"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "resp_123",
-            "created_at": 1,
+            "id": "chatcmpl_123",
+            "object": "chat.completion",
+            "created": 1,
             "model": "gpt-4.1",
-            "output": [
+            "choices": [
                 {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        { "type": "output_text", "text": "hello from upstream" }
-                    ]
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "hello from upstream" },
+                    "finish_reason": "stop"
                 }
             ],
             "usage": {
-                "input_tokens": 1,
-                "output_tokens": 2,
+                "prompt_tokens": 1,
+                "completion_tokens": 2,
                 "total_tokens": 3
-            },
-            "status": "completed"
+            }
         })))
         .mount(&mock_server)
         .await;
@@ -60,20 +58,19 @@ async fn proxies_non_streaming_request() {
     let server = TestServer::new(build_router(state)).unwrap();
 
     let response = server
-        .post("/v1/chat/completions")
+        .post("/v1/responses")
         .json(&serde_json::json!({
             "model": "gpt-4.1",
-            "messages": [
-                { "role": "user", "content": "hi" }
+            "input": [
+                { "role": "user", "content": [{"type": "input_text", "text": "hi"}] }
             ]
         }))
         .await;
 
     response.assert_status_ok();
-    assert_eq!(
-        response.json::<serde_json::Value>()["choices"][0]["message"]["content"],
-        "hello from upstream"
-    );
+    let body = response.json::<serde_json::Value>();
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["output"][0]["content"][0]["text"], "hello from upstream");
 }
 
 #[tokio::test]
@@ -83,13 +80,13 @@ async fn rejects_unsupported_field() {
     let server = TestServer::new(build_router(state)).unwrap();
 
     let response = server
-        .post("/v1/chat/completions")
+        .post("/v1/responses")
         .json(&serde_json::json!({
             "model": "gpt-4.1",
-            "messages": [
-                { "role": "user", "content": "hi" }
+            "input": [
+                { "role": "user", "content": [{"type": "input_text", "text": "hi"}] }
             ],
-            "response_format": { "type": "json_object" }
+            "metadata": { "k": "v" }
         }))
         .await;
 
@@ -103,7 +100,7 @@ async fn rejects_non_json_content_type() {
     let server = TestServer::new(build_router(state)).unwrap();
 
     let response = server
-        .post("/v1/chat/completions")
+        .post("/v1/responses")
         .add_header("content-type", "text/plain")
         .text("not json")
         .await;
@@ -115,7 +112,7 @@ async fn rejects_non_json_content_type() {
 async fn rejects_malformed_upstream_json() {
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v1/responses"))
+        .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "application/json")
@@ -128,15 +125,18 @@ async fn rejects_malformed_upstream_json() {
     let server = TestServer::new(build_router(state)).unwrap();
 
     let response = server
-        .post("/v1/chat/completions")
+        .post("/v1/responses")
         .json(&serde_json::json!({
             "model": "gpt-4.1",
-            "messages": [
-                { "role": "user", "content": "hi" }
+            "input": [
+                { "role": "user", "content": [{"type": "input_text", "text": "hi"}] }
             ]
         }))
         .await;
 
     response.assert_status(StatusCode::BAD_GATEWAY);
-    assert_eq!(response.json::<serde_json::Value>()["error"]["code"], "upstream_invalid_response");
+    assert_eq!(
+        response.json::<serde_json::Value>()["error"]["code"],
+        "upstream_invalid_response"
+    );
 }

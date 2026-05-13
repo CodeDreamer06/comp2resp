@@ -3,11 +3,10 @@ use std::collections::BTreeMap;
 use crate::{
     error::ProxyError,
     openai::{
-        chat::{
-            ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, StreamingToolCallDelta,
-            StreamingToolFunctionDelta,
+        chat::ChatCompletionChunk,
+        responses::{
+            ResponseOutputContentPart, ResponseOutputItem, ResponsesApiResponse, ResponsesStreamEvent,
         },
-        responses::ResponsesStreamEvent,
     },
 };
 
@@ -16,8 +15,19 @@ pub struct StreamContext {
     pub response_id: String,
     pub model: String,
     pub created: u64,
-    tool_indexes: BTreeMap<String, u32>,
+    text_accumulated: String,
+    text_started: bool,
     role_emitted: bool,
+    done_emitted: bool,
+    tool_calls: BTreeMap<u32, PartialToolCall>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PartialToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+    item_emitted: bool,
 }
 
 impl StreamContext {
@@ -26,286 +36,558 @@ impl StreamContext {
             response_id,
             model,
             created,
-            tool_indexes: BTreeMap::new(),
+            text_accumulated: String::new(),
+            text_started: false,
             role_emitted: false,
-        }
-    }
-
-    pub fn initial_chunk(&mut self) -> ChatCompletionChunk {
-        self.role_emitted = true;
-        ChatCompletionChunk {
-            id: self.response_id.clone(),
-            object: "chat.completion.chunk",
-            created: self.created,
-            model: self.model.clone(),
-            choices: vec![ChatChunkChoice {
-                index: 0,
-                delta: ChatChunkDelta {
-                    role: Some("assistant"),
-                    content: None,
-                    tool_calls: None,
-                },
-                finish_reason: None,
-            }],
+            done_emitted: false,
+            tool_calls: BTreeMap::new(),
         }
     }
 }
 
 pub fn translate_stream_event(
     context: &mut StreamContext,
-    event: ResponsesStreamEvent,
-) -> Result<Vec<ChatCompletionChunk>, ProxyError> {
-    let mut chunks = Vec::new();
+    chunk: ChatCompletionChunk,
+) -> Result<Vec<ResponsesStreamEvent>, ProxyError> {
+    let mut events = Vec::new();
 
-    if !context.role_emitted {
-        chunks.push(context.initial_chunk());
+    let choice = chunk
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            ProxyError::upstream(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "upstream_invalid_response",
+                "upstream chunk missing choices",
+            )
+        })?;
+
+    if !context.role_emitted && choice.delta.role.is_some() {
+        context.role_emitted = true;
+        events.push(ResponsesStreamEvent {
+            event_type: "response.created".to_string(),
+            response: Some(ResponsesApiResponse {
+                id: chunk.id.clone(),
+                created_at: Some(chunk.created),
+                model: chunk.model.clone(),
+                output: vec![],
+                usage: None,
+                status: Some("in_progress".to_string()),
+                incomplete_details: None,
+            }),
+            item_id: None,
+            output_index: None,
+            content_index: None,
+            delta: None,
+            arguments: None,
+            item: None,
+        });
     }
 
-    match event.event_type.as_str() {
-        "response.output_text.delta" => {
-            let delta = event.delta.ok_or_else(|| {
-                ProxyError::upstream(
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    "upstream_invalid_response",
-                    "response.output_text.delta missing delta",
-                )
-            })?;
-
-            chunks.push(simple_chunk(
-                context,
-                ChatChunkDelta {
-                    role: None,
-                    content: Some(delta),
-                    tool_calls: None,
-                },
-                None,
-            ));
-        }
-        "response.function_call_arguments.delta" => {
-            let item_id = event.item_id.ok_or_else(|| {
-                ProxyError::upstream(
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    "upstream_invalid_response",
-                    "response.function_call_arguments.delta missing item_id",
-                )
-            })?;
-            let delta = event.delta.ok_or_else(|| {
-                ProxyError::upstream(
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    "upstream_invalid_response",
-                    "response.function_call_arguments.delta missing delta",
-                )
-            })?;
-
-            let index = next_tool_index(&mut context.tool_indexes, &item_id);
-            chunks.push(simple_chunk(
-                context,
-                ChatChunkDelta {
-                    role: None,
-                    content: None,
-                    tool_calls: Some(vec![StreamingToolCallDelta {
-                        index,
-                        id: Some(item_id),
-                        kind: Some("function".to_string()),
-                        function: Some(StreamingToolFunctionDelta {
-                            name: None,
-                            arguments: Some(delta),
-                        }),
-                    }]),
-                },
-                None,
-            ));
-        }
-        "response.output_item.added" => {
-            if let Some(item) = event.item {
-                if item.kind == "function_call" {
-                    let item_id = item.call_id.or(item.id).ok_or_else(|| {
-                        ProxyError::upstream(
-                            axum::http::StatusCode::BAD_GATEWAY,
-                            "upstream_invalid_response",
-                            "function_call item missing id",
-                        )
-                    })?;
-                    let index = next_tool_index(&mut context.tool_indexes, &item_id);
-                    chunks.push(simple_chunk(
-                        context,
-                        ChatChunkDelta {
-                            role: None,
-                            content: None,
-                            tool_calls: Some(vec![StreamingToolCallDelta {
-                                index,
-                                id: Some(item_id),
-                                kind: Some("function".to_string()),
-                                function: Some(StreamingToolFunctionDelta {
-                                    name: item.name,
-                                    arguments: None,
-                                }),
-                            }]),
-                        },
-                        None,
-                    ));
-                }
+    if let Some(content) = choice.delta.content {
+        if !content.is_empty() {
+            if !context.text_started {
+                context.text_started = true;
+                events.push(ResponsesStreamEvent {
+                    event_type: "response.output_item.added".to_string(),
+                    response: None,
+                    item_id: Some(format!("{}_msg", chunk.id)),
+                    output_index: Some(0),
+                    content_index: None,
+                    delta: None,
+                    arguments: None,
+                    item: Some(ResponseOutputItem {
+                        id: Some(format!("{}_msg", chunk.id)),
+                        kind: "message".to_string(),
+                        role: Some("assistant".to_string()),
+                        content: vec![],
+                        name: None,
+                        arguments: None,
+                        call_id: None,
+                    }),
+                });
+                events.push(ResponsesStreamEvent {
+                    event_type: "response.content_part.added".to_string(),
+                    response: None,
+                    item_id: Some(format!("{}_msg", chunk.id)),
+                    output_index: Some(0),
+                    content_index: Some(0),
+                    delta: None,
+                    arguments: None,
+                    item: Some(ResponseOutputItem {
+                        id: Some(format!("{}_part", chunk.id)),
+                        kind: "output_text".to_string(),
+                        role: None,
+                        content: vec![ResponseOutputContentPart {
+                            kind: "output_text".to_string(),
+                            text: Some(String::new()),
+                        }],
+                        name: None,
+                        arguments: None,
+                        call_id: None,
+                    }),
+                });
             }
+            context.text_accumulated.push_str(&content);
+            events.push(ResponsesStreamEvent {
+                event_type: "response.output_text.delta".to_string(),
+                response: None,
+                item_id: Some(format!("{}_msg", chunk.id)),
+                output_index: Some(0),
+                content_index: Some(0),
+                delta: Some(content),
+                arguments: None,
+                item: None,
+            });
         }
-        "response.completed" => {
-            let finish_reason = match event
-                .response
-                .as_ref()
-                .and_then(|response| response.status.as_deref())
-            {
-                None | Some("completed") => Some("stop".to_string()),
-                Some("incomplete") => {
-                    let reason = event
-                        .response
-                        .as_ref()
-                        .and_then(|response| response.incomplete_details.as_ref())
-                        .and_then(|details| details.get("reason"))
-                        .and_then(|value| value.as_str());
+    }
 
-                    match reason {
-                        Some("max_output_tokens") | Some("max_completion_tokens") => {
-                            Some("length".to_string())
-                        }
-                        Some("content_filter") => Some("content_filter".to_string()),
-                        Some(other) => {
-                            return Err(ProxyError::upstream(
-                                axum::http::StatusCode::BAD_GATEWAY,
-                                "stream_translation_failed",
-                                format!("unsupported upstream stream completion reason: {other}"),
-                            ));
-                        }
-                        None => {
-                            return Err(ProxyError::upstream(
-                                axum::http::StatusCode::BAD_GATEWAY,
-                                "stream_translation_failed",
-                                "upstream incomplete stream response missing incomplete_details.reason",
-                            ));
-                        }
-                    }
-                }
-                Some(other) => {
+    if let Some(tool_call_deltas) = choice.delta.tool_calls {
+        for delta in tool_call_deltas {
+            let index = delta.index;
+            let tc = context.tool_calls.entry(index).or_default();
+
+            if let Some(id) = delta.id {
+                tc.id = Some(id);
+            }
+            if let Some(kind) = delta.kind {
+                if kind != "function" {
                     return Err(ProxyError::upstream(
                         axum::http::StatusCode::BAD_GATEWAY,
                         "stream_translation_failed",
-                        format!("unsupported upstream stream status: {other}"),
+                        format!("unsupported tool call type in stream: {kind}"),
                     ));
                 }
-            };
+            }
+            if let Some(ref function) = delta.function {
+                if let Some(name) = function.name.clone() {
+                    tc.name = Some(name);
+                }
+                if let Some(arguments) = function.arguments.clone() {
+                    tc.arguments.push_str(&arguments);
+                }
+            }
 
-            chunks.push(simple_chunk(
-                context,
-                ChatChunkDelta::default(),
-                finish_reason,
-            ));
+            if !tc.item_emitted && tc.id.is_some() && tc.name.is_some() {
+                tc.item_emitted = true;
+                events.push(ResponsesStreamEvent {
+                    event_type: "response.output_item.added".to_string(),
+                    response: None,
+                    item_id: tc.id.clone(),
+                    output_index: Some(index),
+                    content_index: None,
+                    delta: None,
+                    arguments: None,
+                    item: Some(ResponseOutputItem {
+                        id: tc.id.clone(),
+                        kind: "function_call".to_string(),
+                        role: None,
+                        content: vec![],
+                        name: tc.name.clone(),
+                        arguments: Some(String::new()),
+                        call_id: tc.id.clone(),
+                    }),
+                });
+            }
+
+            if tc.item_emitted {
+                if let Some(ref function) = delta.function {
+                    if let Some(ref arguments) = function.arguments {
+                        if !arguments.is_empty() {
+                            events.push(ResponsesStreamEvent {
+                                event_type: "response.function_call_arguments.delta".to_string(),
+                                response: None,
+                                item_id: tc.id.clone(),
+                                output_index: Some(index),
+                                content_index: None,
+                                delta: Some(arguments.clone()),
+                                arguments: None,
+                                item: None,
+                            });
+                        }
+                    }
+                }
+            }
         }
-        "response.failed" => {
-            return Err(ProxyError::upstream(
-                axum::http::StatusCode::BAD_GATEWAY,
-                "stream_translation_failed",
-                "upstream stream reported response.failed",
-            ));
-        }
-        "response.created"
-        | "response.in_progress"
-        | "response.output_item.done"
-        | "response.content_part.added"
-        | "response.content_part.done"
-        | "response.output_text.done"
-        | "response.function_call_arguments.done" => {}
-        other => {
-            return Err(ProxyError::upstream(
-                axum::http::StatusCode::BAD_GATEWAY,
-                "stream_translation_failed",
-                format!("unsupported upstream stream event type: {other}"),
-            ));
-        }
     }
 
-    Ok(chunks)
-}
+    if let Some(finish_reason) = choice.finish_reason {
+        if !context.done_emitted {
+            context.done_emitted = true;
 
-fn simple_chunk(
-    context: &StreamContext,
-    delta: ChatChunkDelta,
-    finish_reason: Option<String>,
-) -> ChatCompletionChunk {
-    ChatCompletionChunk {
-        id: context.response_id.clone(),
-        object: "chat.completion.chunk",
-        created: context.created,
-        model: context.model.clone(),
-        choices: vec![ChatChunkChoice {
-            index: 0,
-            delta,
-            finish_reason,
-        }],
-    }
-}
+            let (status, incomplete_details) =
+                super::response::map_finish_reason(Some(&finish_reason))?;
 
-fn next_tool_index(indexes: &mut BTreeMap<String, u32>, item_id: &str) -> u32 {
-    if let Some(index) = indexes.get(item_id) {
-        return *index;
-    }
+            if context.text_started {
+                events.push(ResponsesStreamEvent {
+                    event_type: "response.output_text.done".to_string(),
+                    response: None,
+                    item_id: Some(format!("{}_msg", chunk.id)),
+                    output_index: Some(0),
+                    content_index: Some(0),
+                    delta: None,
+                    arguments: None,
+                    item: None,
+                });
+                events.push(ResponsesStreamEvent {
+                    event_type: "response.content_part.done".to_string(),
+                    response: None,
+                    item_id: Some(format!("{}_msg", chunk.id)),
+                    output_index: Some(0),
+                    content_index: Some(0),
+                    delta: None,
+                    arguments: None,
+                    item: Some(ResponseOutputItem {
+                        id: Some(format!("{}_part", chunk.id)),
+                        kind: "output_text".to_string(),
+                        role: None,
+                        content: vec![ResponseOutputContentPart {
+                            kind: "output_text".to_string(),
+                            text: Some(context.text_accumulated.clone()),
+                        }],
+                        name: None,
+                        arguments: None,
+                        call_id: None,
+                    }),
+                });
+                events.push(ResponsesStreamEvent {
+                    event_type: "response.output_item.done".to_string(),
+                    response: None,
+                    item_id: Some(format!("{}_msg", chunk.id)),
+                    output_index: Some(0),
+                    content_index: None,
+                    delta: None,
+                    arguments: None,
+                    item: Some(ResponseOutputItem {
+                        id: Some(format!("{}_msg", chunk.id)),
+                        kind: "message".to_string(),
+                        role: Some("assistant".to_string()),
+                        content: vec![ResponseOutputContentPart {
+                            kind: "output_text".to_string(),
+                            text: Some(context.text_accumulated.clone()),
+                        }],
+                        name: None,
+                        arguments: None,
+                        call_id: None,
+                    }),
+                });
+            }
 
-    let index = indexes.len() as u32;
-    indexes.insert(item_id.to_string(), index);
-    index
-}
+            for (index, tc) in &context.tool_calls {
+                events.push(ResponsesStreamEvent {
+                    event_type: "response.function_call_arguments.done".to_string(),
+                    response: None,
+                    item_id: tc.id.clone(),
+                    output_index: Some(*index),
+                    content_index: None,
+                    delta: None,
+                    arguments: Some(tc.arguments.clone()),
+                    item: None,
+                });
+                events.push(ResponsesStreamEvent {
+                    event_type: "response.output_item.done".to_string(),
+                    response: None,
+                    item_id: tc.id.clone(),
+                    output_index: Some(*index),
+                    content_index: None,
+                    delta: None,
+                    arguments: None,
+                    item: Some(ResponseOutputItem {
+                        id: tc.id.clone(),
+                        kind: "function_call".to_string(),
+                        role: None,
+                        content: vec![],
+                        name: tc.name.clone(),
+                        arguments: Some(tc.arguments.clone()),
+                        call_id: tc.id.clone(),
+                    }),
+                });
+            }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+            let mut output = Vec::new();
+            if context.text_started {
+                output.push(ResponseOutputItem {
+                    id: Some(format!("{}_msg", context.response_id)),
+                    kind: "message".to_string(),
+                    role: Some("assistant".to_string()),
+                    content: vec![ResponseOutputContentPart {
+                        kind: "output_text".to_string(),
+                        text: Some(context.text_accumulated.clone()),
+                    }],
+                    name: None,
+                    arguments: None,
+                    call_id: None,
+                });
+            }
+            for (_index, tc) in &context.tool_calls {
+                output.push(ResponseOutputItem {
+                    id: tc.id.clone(),
+                    kind: "function_call".to_string(),
+                    role: None,
+                    content: vec![],
+                    name: tc.name.clone(),
+                    arguments: Some(tc.arguments.clone()),
+                    call_id: tc.id.clone(),
+                });
+            }
 
-    #[test]
-    fn emits_initial_role_and_delta() {
-        let mut context = StreamContext::new("resp_1".to_string(), "gpt-4.1".to_string(), 1);
-        let chunks = translate_stream_event(
-            &mut context,
-            ResponsesStreamEvent {
-                event_type: "response.output_text.delta".to_string(),
-                response: None,
-                item_id: None,
-                output_index: None,
-                content_index: None,
-                delta: Some("he".to_string()),
-                item: None,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].choices[0].delta.role, Some("assistant"));
-        assert_eq!(chunks[1].choices[0].delta.content.as_deref(), Some("he"));
-    }
-
-    #[test]
-    fn maps_incomplete_stream_finish_reason() {
-        let mut context = StreamContext::new("resp_1".to_string(), "gpt-4.1".to_string(), 1);
-        let chunks = translate_stream_event(
-            &mut context,
-            ResponsesStreamEvent {
+            events.push(ResponsesStreamEvent {
                 event_type: "response.completed".to_string(),
-                response: Some(crate::openai::responses::ResponsesApiResponse {
-                    id: "resp_1".to_string(),
-                    created_at: Some(1),
-                    model: "gpt-4.1".to_string(),
-                    output: vec![],
+                response: Some(ResponsesApiResponse {
+                    id: chunk.id,
+                    created_at: Some(context.created),
+                    model: context.model.clone(),
+                    output,
                     usage: None,
-                    status: Some("incomplete".to_string()),
-                    incomplete_details: Some(serde_json::json!({ "reason": "content_filter" })),
+                    status: Some(status),
+                    incomplete_details,
                 }),
                 item_id: None,
                 output_index: None,
                 content_index: None,
                 delta: None,
+                arguments: None,
                 item: None,
+            });
+        }
+    }
+
+    Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openai::chat::{
+        ChatChunkChoice, ChatChunkDelta, StreamingToolCallDelta, StreamingToolFunctionDelta,
+    };
+
+    #[test]
+    fn emits_response_created_on_role() {
+        let mut context = StreamContext::new("chatcmpl_1".to_string(), "gpt-4.1".to_string(), 1);
+
+        let events = translate_stream_event(
+            &mut context,
+            ChatCompletionChunk {
+                id: "chatcmpl_1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1,
+                model: "gpt-4.1".to_string(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatChunkDelta {
+                        role: Some("assistant".to_string()),
+                        content: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: None,
+                }],
             },
         )
         .unwrap();
 
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "response.created");
+    }
+
+    #[test]
+    fn emits_text_events() {
+        let mut context = StreamContext::new("chatcmpl_1".to_string(), "gpt-4.1".to_string(), 1);
+        context.role_emitted = true;
+
+        let events = translate_stream_event(
+            &mut context,
+            ChatCompletionChunk {
+                id: "chatcmpl_1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1,
+                model: "gpt-4.1".to_string(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatChunkDelta {
+                        role: None,
+                        content: Some("hello".to_string()),
+                        tool_calls: None,
+                    },
+                    finish_reason: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events[0].event_type, "response.output_item.added");
+        assert_eq!(events[1].event_type, "response.content_part.added");
+        assert_eq!(events[2].event_type, "response.output_text.delta");
+        assert_eq!(events[2].delta.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn emits_tool_call_events() {
+        let mut context = StreamContext::new("chatcmpl_1".to_string(), "gpt-4.1".to_string(), 1);
+        context.role_emitted = true;
+
+        let events = translate_stream_event(
+            &mut context,
+            ChatCompletionChunk {
+                id: "chatcmpl_1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1,
+                model: "gpt-4.1".to_string(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatChunkDelta {
+                        role: None,
+                        content: None,
+                        tool_calls: Some(vec![StreamingToolCallDelta {
+                            index: 0,
+                            id: Some("call_123".to_string()),
+                            kind: Some("function".to_string()),
+                            function: Some(StreamingToolFunctionDelta {
+                                name: Some("get_weather".to_string()),
+                                arguments: None,
+                            }),
+                        }]),
+                    },
+                    finish_reason: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "response.output_item.added");
+        assert_eq!(events[0].item.as_ref().unwrap().kind, "function_call");
         assert_eq!(
-            chunks.last().unwrap().choices[0].finish_reason.as_deref(),
-            Some("content_filter")
+            events[0].item.as_ref().unwrap().name.as_deref(),
+            Some("get_weather")
+        );
+    }
+
+    #[test]
+    fn emits_tool_call_argument_delta() {
+        let mut context = StreamContext::new("chatcmpl_1".to_string(), "gpt-4.1".to_string(), 1);
+        context.role_emitted = true;
+        context.tool_calls.insert(
+            0,
+            PartialToolCall {
+                id: Some("call_123".to_string()),
+                name: Some("get_weather".to_string()),
+                arguments: String::new(),
+                item_emitted: true,
+            },
+        );
+
+        let events = translate_stream_event(
+            &mut context,
+            ChatCompletionChunk {
+                id: "chatcmpl_1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1,
+                model: "gpt-4.1".to_string(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatChunkDelta {
+                        role: None,
+                        content: None,
+                        tool_calls: Some(vec![StreamingToolCallDelta {
+                            index: 0,
+                            id: None,
+                            kind: None,
+                            function: Some(StreamingToolFunctionDelta {
+                                name: None,
+                                arguments: Some("{\"city\":\"NYC\"}".to_string()),
+                            }),
+                        }]),
+                    },
+                    finish_reason: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].event_type,
+            "response.function_call_arguments.delta"
+        );
+        assert_eq!(
+            events[0].delta.as_deref(),
+            Some("{\"city\":\"NYC\"}")
+        );
+    }
+
+    #[test]
+    fn emits_completion_events_on_text_finish() {
+        let mut context = StreamContext::new("chatcmpl_1".to_string(), "gpt-4.1".to_string(), 1);
+        context.role_emitted = true;
+        context.text_started = true;
+        context.text_accumulated = "hello".to_string();
+
+        let events = translate_stream_event(
+            &mut context,
+            ChatCompletionChunk {
+                id: "chatcmpl_1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1,
+                model: "gpt-4.1".to_string(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatChunkDelta::default(),
+                    finish_reason: Some("stop".to_string()),
+                }],
+            },
+        )
+        .unwrap();
+
+        let types: Vec<_> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(types.contains(&"response.output_text.done"));
+        assert!(types.contains(&"response.content_part.done"));
+        assert!(types.contains(&"response.output_item.done"));
+        assert!(types.contains(&"response.completed"));
+    }
+
+    #[test]
+    fn emits_completion_events_on_tool_calls_finish() {
+        let mut context = StreamContext::new("chatcmpl_1".to_string(), "gpt-4.1".to_string(), 1);
+        context.role_emitted = true;
+        context.tool_calls.insert(
+            0,
+            PartialToolCall {
+                id: Some("call_123".to_string()),
+                name: Some("get_weather".to_string()),
+                arguments: "{\"city\":\"NYC\"}".to_string(),
+                item_emitted: true,
+            },
+        );
+
+        let events = translate_stream_event(
+            &mut context,
+            ChatCompletionChunk {
+                id: "chatcmpl_1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1,
+                model: "gpt-4.1".to_string(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatChunkDelta::default(),
+                    finish_reason: Some("tool_calls".to_string()),
+                }],
+            },
+        )
+        .unwrap();
+
+        let types: Vec<_> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(types.contains(&"response.function_call_arguments.done"));
+        assert!(types.contains(&"response.output_item.done"));
+        assert!(types.contains(&"response.completed"));
+        let completed = events
+            .iter()
+            .find(|e| e.event_type == "response.completed")
+            .unwrap();
+        assert_eq!(
+            completed.response.as_ref().unwrap().status.as_deref(),
+            Some("completed")
         );
     }
 }

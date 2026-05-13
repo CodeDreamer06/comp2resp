@@ -4,18 +4,18 @@ use reqwest::{header, StatusCode};
 
 use crate::{
     error::ProxyError,
-    openai::responses::{ResponsesApiResponse, ResponsesRequest, ResponsesStreamEvent},
+    openai::chat::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
     state::AppState,
 };
 
-pub async fn create_response(
+pub async fn create_chat_completion(
     state: &AppState,
     bearer_token: Option<&str>,
-    payload: &ResponsesRequest,
-) -> Result<ResponsesApiResponse, ProxyError> {
+    payload: &ChatCompletionRequest,
+) -> Result<ChatCompletionResponse, ProxyError> {
     let request = state
         .client
-        .post(format!("{}/v1/responses", state.config.openai_base_url))
+        .post(format!("{}/v1/chat/completions", state.config.openai_base_url))
         .header(
             header::AUTHORIZATION,
             format!("Bearer {}", resolve_bearer(state, bearer_token)?),
@@ -34,7 +34,7 @@ pub async fn create_response(
     }
 
     response
-        .json::<ResponsesApiResponse>()
+        .json::<ChatCompletionResponse>()
         .await
         .map_err(|source| {
             ProxyError::upstream(
@@ -45,14 +45,14 @@ pub async fn create_response(
         })
 }
 
-pub async fn create_response_stream(
+pub async fn create_chat_completion_stream(
     state: &AppState,
     bearer_token: Option<&str>,
-    payload: &ResponsesRequest,
-) -> Result<impl Stream<Item = Result<ResponsesStreamEvent, ProxyError>>, ProxyError> {
+    payload: &ChatCompletionRequest,
+) -> Result<impl Stream<Item = Result<ChatCompletionChunk, ProxyError>>, ProxyError> {
     let response = state
         .client
-        .post(format!("{}/v1/responses", state.config.openai_base_url))
+        .post(format!("{}/v1/chat/completions", state.config.openai_base_url))
         .header(
             header::AUTHORIZATION,
             format!("Bearer {}", resolve_bearer(state, bearer_token)?),
@@ -77,7 +77,7 @@ pub async fn create_response_stream(
 
 fn parse_sse_bytes(
     chunk: Result<Bytes, reqwest::Error>,
-) -> Result<ResponsesStreamEvent, ProxyError> {
+) -> Result<ChatCompletionChunk, ProxyError> {
     let bytes = chunk.map_err(map_transport_error)?;
     let text = std::str::from_utf8(&bytes).map_err(|source| {
         ProxyError::upstream(

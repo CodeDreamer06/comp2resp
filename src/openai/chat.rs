@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -71,14 +71,14 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum ChatMessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ContentPart {
     #[serde(rename = "type")]
     pub kind: String,
@@ -134,10 +134,10 @@ pub struct ToolChoiceFunction {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
-    pub object: &'static str,
+    pub object: String,
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChatChoice>,
@@ -145,55 +145,55 @@ pub struct ChatCompletionResponse {
     pub system_fingerprint: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatChoice {
     pub index: u32,
     pub message: ChatAssistantMessage,
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatAssistantMessage {
-    pub role: &'static str,
+    pub role: String,
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<AssistantToolCall>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionChunk {
     pub id: String,
-    pub object: &'static str,
+    pub object: String,
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChatChunkChoice>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatChunkChoice {
     pub index: u32,
     pub delta: ChatChunkDelta,
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ChatChunkDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<&'static str>,
+    pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<StreamingToolCallDelta>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StreamingToolCallDelta {
     pub index: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -204,7 +204,7 @@ pub struct StreamingToolCallDelta {
     pub function: Option<StreamingToolFunctionDelta>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StreamingToolFunctionDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,

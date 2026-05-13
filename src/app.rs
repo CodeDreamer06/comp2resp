@@ -20,8 +20,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/healthz", get(routes::health::healthz))
         .route("/readyz", get(routes::health::readyz))
         .route(
-            "/v1/chat/completions",
-            post(routes::chat_completions::create_chat_completion),
+            "/v1/responses",
+            post(routes::responses::create_response),
         )
         .fallback(handler_404)
         .layer(DefaultBodyLimit::max(state.config.max_request_body_bytes))

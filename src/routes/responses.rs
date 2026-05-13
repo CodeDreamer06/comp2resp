@@ -14,7 +14,7 @@ use tracing::error;
 use crate::{
     config::InboundAuthMode,
     error::ProxyError,
-    openai::{chat::ChatCompletionRequest, responses::ResponsesStreamEvent},
+    openai::{chat::ChatCompletionChunk, responses::ResponsesStreamEvent},
     state::AppState,
     translate::{
         request::translate_chat_request,
@@ -24,10 +24,10 @@ use crate::{
     upstream,
 };
 
-pub async fn create_chat_completion(
+pub async fn create_response(
     State(state): State<AppState>,
     headers: HeaderMap,
-    payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
+    payload: Result<Json<crate::openai::responses::ResponsesRequest>, JsonRejection>,
 ) -> Response {
     let request_id = extract_request_id(&state, &headers);
 
@@ -65,15 +65,18 @@ async fn handle_request(
     state: AppState,
     headers: HeaderMap,
     request_id: String,
-    request: ChatCompletionRequest,
+    request: crate::openai::responses::ResponsesRequest,
 ) -> Result<Response, ProxyError> {
     let inbound_bearer = authenticate(&state, &headers)?;
     let upstream_request = translate_chat_request(request, &state.config)?;
 
-    if upstream_request.stream == Some(true) {
-        let upstream_stream =
-            upstream::create_response_stream(&state, inbound_bearer.as_deref(), &upstream_request)
-                .await?;
+    if upstream_request.stream {
+        let upstream_stream = upstream::create_chat_completion_stream(
+            &state,
+            inbound_bearer.as_deref(),
+            &upstream_request,
+        )
+        .await?;
         let stream = stream_response(request_id, upstream_stream);
 
         return Ok(Response::builder()
@@ -89,11 +92,15 @@ async fn handle_request(
             })?);
     }
 
-    let upstream_response =
-        upstream::create_response(&state, inbound_bearer.as_deref(), &upstream_request).await?;
-    let chat_response = translate_response(upstream_response)?;
+    let upstream_response = upstream::create_chat_completion(
+        &state,
+        inbound_bearer.as_deref(),
+        &upstream_request,
+    )
+    .await?;
+    let responses_response = translate_response(upstream_response)?;
 
-    Ok((StatusCode::OK, Json(chat_response)).into_response())
+    Ok((StatusCode::OK, Json(responses_response)).into_response())
 }
 
 fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Option<String>, ProxyError> {
@@ -149,44 +156,34 @@ fn stream_response<S>(
     upstream_stream: S,
 ) -> impl futures::Stream<Item = Result<Bytes, Infallible>>
 where
-    S: futures::Stream<Item = Result<ResponsesStreamEvent, ProxyError>> + Send + 'static,
+    S: futures::Stream<Item = Result<ChatCompletionChunk, ProxyError>> + Send + 'static,
 {
     let mut context: Option<StreamContext> = None;
 
-    upstream_stream.flat_map(move |event_result| {
+    upstream_stream.flat_map(move |chunk_result| {
         let request_id = request_id.clone();
 
-        let frames = match event_result {
-            Ok(event) => {
+        let frames = match chunk_result {
+            Ok(chunk) => {
                 if context.is_none() {
-                    if let Some(response) = event.response.as_ref() {
-                        context = Some(StreamContext::new(
-                            response.id.clone(),
-                            response.model.clone(),
-                            response.created_at.unwrap_or(0),
-                        ));
-                    } else {
-                        let fallback_id = event
-                            .item_id
-                            .clone()
-                            .unwrap_or_else(|| "resp_stream".to_string());
-                        context = Some(StreamContext::new(fallback_id, "unknown".to_string(), 0));
-                    }
+                    context = Some(StreamContext::new(
+                        chunk.id.clone(),
+                        chunk.model.clone(),
+                        chunk.created,
+                    ));
                 }
 
-                match translate_stream_event(context.as_mut().expect("context initialized"), event)
+                match translate_stream_event(context.as_mut().expect("context initialized"), chunk)
                 {
-                    Ok(chunks) => {
-                        let is_done = chunks
-                            .last()
-                            .and_then(|chunk| chunk.choices.first())
-                            .and_then(|choice| choice.finish_reason.as_ref())
-                            .is_some();
+                    Ok(events) => {
+                        let is_done = events
+                            .iter()
+                            .any(|event| event.event_type == "response.completed");
 
-                        let mut frames = chunks
+                        let mut frames = events
                             .into_iter()
-                            .map(|chunk| {
-                                let payload = serde_json::to_string(&chunk)
+                            .map(|event| {
+                                let payload = serde_json::to_string(&event)
                                     .unwrap_or_else(|_| "{}".to_string());
                                 Ok(Bytes::from(format!("data: {payload}\n\n")))
                             })
@@ -210,7 +207,18 @@ where
 
 fn format_sse_error(error: ProxyError, request_id: &str) -> String {
     let envelope = error.into_envelope(request_id.to_string());
+    let _event = ResponsesStreamEvent {
+        event_type: "error".to_string(),
+        response: None,
+        item_id: None,
+        output_index: None,
+        content_index: None,
+        delta: None,
+        arguments: None,
+        item: None,
+    };
     let payload = serde_json::json!({
+        "type": "error",
         "error": envelope.error,
     });
     format!("data: {}\n\n", payload)

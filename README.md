@@ -1,6 +1,6 @@
 # comp2resp
 
-`comp2resp` is a Rust HTTP proxy that accepts an OpenAI-compatible `POST /v1/chat/completions` request, translates it into an upstream OpenAI `POST /v1/responses` request, and returns a chat-completions-compatible response.
+`comp2resp` is a Rust HTTP proxy that accepts an OpenAI-compatible `POST /v1/responses` request, translates it into an upstream OpenAI `POST /v1/chat/completions` request, and returns a Responses-compatible response.
 
 The project is intentionally strict. Unsupported or ambiguous request shapes are rejected with explicit machine-readable errors instead of being silently ignored, partially translated, or coerced into a best-effort request.
 
@@ -10,9 +10,9 @@ This project is being built spec-first. The implementation follows this README c
 
 ## Goals
 
-- Accept OpenAI-compatible chat completion requests.
-- Translate them into OpenAI Responses API requests.
-- Return chat-completions-compatible responses.
+- Accept OpenAI-compatible Responses API requests.
+- Translate them into OpenAI Chat Completions API requests.
+- Return Responses-compatible responses.
 - Support both non-streaming and streaming requests.
 - Preserve correctness over broad compatibility.
 - Emit explicit errors for invalid or unsupported behavior.
@@ -23,13 +23,13 @@ This project is being built spec-first. The implementation follows this README c
 - Supporting multiple upstream providers in the first version.
 - Silently accepting loosely compatible or partially mappable request fields.
 - Preserving undocumented behavior from third-party OpenAI-compatible providers.
-- Supporting every historical chat-completions field in the first release.
+- Supporting every historical responses field in the first release.
 
 ## Supported Surface
 
 ### Inbound endpoint
 
-- `POST /v1/chat/completions`
+- `POST /v1/responses`
 
 ### Operational endpoints
 
@@ -38,9 +38,9 @@ This project is being built spec-first. The implementation follows this README c
 
 ### Upstream endpoint
 
-- `POST {OPENAI_BASE_URL}/v1/responses`
+- `POST {OPENAI_BASE_URL}/v1/chat/completions`
 
-The first version targets OpenAI Responses semantics only.
+The first version targets Chat Completions semantics on the upstream side.
 
 ## API Contract
 
@@ -65,91 +65,62 @@ Upstream authentication is always bearer-token based.
 ### Required request fields
 
 - `model`
-- `messages`
+- `input`
 
 ### Supported request fields in v1
 
 - `model`
-- `messages`
+- `input`
 - `stream`
 - `temperature`
 - `top_p`
-- `max_tokens`
-- `max_completion_tokens`
+- `max_output_tokens`
 - `tools`
 - `tool_choice`
-- `user`
-- `metadata`
 
 ### Rejected request fields in v1
 
-The proxy rejects these with `422 unsupported_feature` because they either do not map safely to the Responses API contract used here or require additional compatibility semantics not implemented in v1:
+The proxy rejects these with `422 unsupported_feature` because they either do not map safely to the Chat Completions API contract used here or require additional compatibility semantics not implemented in v1:
 
-- `n` when present and not equal to `1`
-- `logprobs`
-- `top_logprobs`
-- `logit_bias`
-- `presence_penalty`
-- `frequency_penalty`
-- `seed`
-- `response_format`
-- `parallel_tool_calls`
-- `functions`
-- `function_call`
-- `audio`
-- `modalities`
-- `prediction`
-- `service_tier`
-- `store`
-- `reasoning_effort`
+- `metadata`
+- `instructions`
+- `previous_response_id`
+- `truncation`
 - any unknown top-level field
 
 If a field is unsupported, the request fails. The proxy does not drop it and continue.
 
-## Message Compatibility
+## Input Compatibility
+
+### Supported input item types
+
+- `message` with `role` and `content`
+- `function_call`
+- `function_call_output`
 
 ### Supported message roles
 
 - `system`
 - `user`
 - `assistant`
-- `tool`
 
 ### Supported message content forms
 
-#### `system`
-
-- string content only
-
-#### `user`
-
 - string content
-- array content containing only text parts
+- array content containing only `input_text` parts
 
-#### `assistant`
+### Rejected input shapes in v1
 
-- string content
-- explicit `tool_calls`
-
-#### `tool`
-
-- string content with `tool_call_id`
-
-### Rejected message shapes in v1
-
-- image parts
-- audio parts
-- file parts
-- refusal parts supplied by the caller
-- assistant messages containing both incompatible content structures and tool calls
-- messages with unknown roles
-- messages missing required role-specific fields
+- image, audio, or file parts
+- unknown input item types
+- messages missing required fields
+- empty content
 
 ## Translation Rules
 
-### Request translation: chat completions -> responses
+### Request translation: responses -> chat completions
 
-The proxy converts the chat-completions request into a Responses request using these rules.
+The proxy converts the Responses request into a Chat Completions request using these rules.
 
 ### Model
 
@@ -162,23 +133,17 @@ The proxy converts the chat-completions request into a Responses request using t
 
 ### Input construction
 
-Inbound `messages` become Responses `input` items.
+Inbound `input` items become Chat Completions `messages`.
 
 Mapping rules:
 
-- `system` message -> response input item with role `system` and text content
-- `user` message -> response input item with role `user` and text content
-- `assistant` message with plain text -> response input item with role `assistant` and output text content
-- `assistant` message with `tool_calls` -> response input item with role `assistant` and function call items
-- `tool` message -> function call output item tied to `tool_call_id`
+- `message` item with role -> chat message with same role and text content
+- `function_call` item -> assistant message with `tool_calls`
+- `function_call_output` item -> tool message with `tool_call_id` and output content
 
 ### Token limit fields
 
-- If `max_completion_tokens` is present, it is used.
-- Else if `max_tokens` is present, it is used.
-- If both are present and differ, the request is rejected with `422 conflicting_parameters`.
-
-The selected value maps to upstream output token limiting.
+- `max_output_tokens` maps to upstream `max_tokens`.
 
 ### Sampling fields
 
@@ -192,65 +157,57 @@ Validation rules:
 
 ### Tools
 
-- Chat-completions `tools` of type `function` map to Responses tools of type `function`.
+- Responses `tools` of type `function` map to Chat Completions tools of type `function`.
 - Tool schema is preserved.
 - Unsupported tool types are rejected.
 
 ### Tool choice
 
 - `none`, `auto`, and named function selection are supported when representable upstream.
+- `required` is rejected in v1.
 - Unsupported tool choice shapes are rejected.
-
-### User field
-
-- `user` is forwarded as metadata only if configured to preserve it.
-- If user forwarding is disabled, the field is rejected rather than silently dropped.
-
-### Metadata
-
-- `metadata` is forwarded when valid for upstream.
-- Invalid metadata values are rejected.
 
 ## Response Translation
 
 ### Non-streaming responses
 
-The proxy converts a completed Responses API object into a single chat completion response object.
+The proxy converts a completed Chat Completions response into a single Responses-compatible response object.
 
 Returned top-level fields:
 
 - `id`
-- `object = "chat.completion"`
-- `created`
+- `created_at`
 - `model`
-- `choices`
+- `output`
 - `usage`
-- `system_fingerprint = null`
+- `status`
+- `incomplete_details` when applicable
 
-### Choice semantics
+### Output semantics
 
-The first version returns exactly one choice.
+The proxy synthesizes `output` items from the upstream assistant message:
 
-- `choices[0].index = 0`
-- `choices[0].message.role = "assistant"`
-- `choices[0].message.content` is synthesized from upstream output text
-- `choices[0].message.tool_calls` is synthesized from upstream function call output items when present
-- `choices[0].finish_reason` is derived from upstream completion state
+- Plain text content becomes a `message` output item with `output_text` content parts.
+- `tool_calls` become `function_call` output items.
 
-### Finish reason mapping
+### Status mapping
 
-Supported finish reasons:
+Supported finish reasons from upstream:
 
-- `stop`
-- `length`
-- `tool_calls`
-- `content_filter`
+- `stop` -> `status: "completed"`
+- `length` -> `status: "incomplete"` with `reason: "max_output_tokens"`
+- `tool_calls` -> `status: "completed"`
+- `content_filter` -> `status: "incomplete"` with `reason: "content_filter"`
 
 If the upstream response cannot be mapped to one of these safely, the proxy fails with `502 upstream_translation_failed` instead of guessing.
 
 ### Usage mapping
 
-When usage is present upstream, the proxy maps it into chat-completions usage fields.
+When usage is present upstream, the proxy maps it into Responses usage fields:
+
+- `prompt_tokens` -> `input_tokens`
+- `completion_tokens` -> `output_tokens`
+- `total_tokens` -> `total_tokens`
 
 If usage is absent or structurally incompatible, the proxy returns `usage: null` only if that behavior is valid for the response shape being emitted. Otherwise it fails explicitly.
 
@@ -258,7 +215,7 @@ If usage is absent or structurally incompatible, the proxy returns `usage: null`
 
 ### Inbound
 
-If the caller sends `stream: true`, the proxy opens an SSE request to the upstream Responses API and emits chat-completions-style SSE chunks.
+If the caller sends `stream: true`, the proxy opens an SSE request to the upstream Chat Completions API and emits Responses-style SSE events.
 
 ### Outbound content type
 
@@ -268,14 +225,14 @@ If the caller sends `stream: true`, the proxy opens an SSE request to the upstre
 
 ### Event translation
 
-Responses semantic events are translated into chat-completions data-only SSE frames.
+Chat Completions SSE chunks are translated into Responses semantic events.
 
 Streaming behavior:
 
-- emit an initial assistant role delta chunk
-- emit content deltas as chat completion `choices[0].delta.content`
-- emit tool call deltas when upstream produces function call arguments incrementally
-- emit a final chunk containing `finish_reason`
+- emit `response.created` on first assistant role chunk
+- emit `response.output_item.added` and `response.content_part.added` for the text message
+- emit `response.output_text.delta` for each content delta
+- emit `response.output_text.done`, `response.content_part.done`, `response.output_item.done`, and `response.completed` on finish
 - terminate with `data: [DONE]`
 
 ### Streaming error behavior
@@ -302,7 +259,7 @@ All non-streaming failures return a JSON body with this shape:
     "message": "human readable error",
     "type": "invalid_request_error",
     "code": "unsupported_feature",
-    "param": "response_format",
+    "param": "metadata",
     "request_id": "req_123"
   }
 }
@@ -466,7 +423,7 @@ src/
   routes/
     mod.rs
     health.rs
-    chat_completions.rs
+    responses.rs
   openai/
     mod.rs
     chat.rs

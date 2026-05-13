@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponsesRequest {
     pub model: String,
     pub input: Vec<ResponseInputItem>,
@@ -22,60 +23,67 @@ pub struct ResponsesRequest {
     pub metadata: Option<BTreeMap<String, String>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ResponseInputItem {
     Message {
         role: String,
-        content: Vec<ResponseContentPart>,
+        content: ResponseInputContent,
     },
     FunctionCall {
         #[serde(rename = "type")]
-        kind: &'static str,
+        kind: String,
         call_id: String,
         name: String,
         arguments: String,
     },
     FunctionCallOutput {
         #[serde(rename = "type")]
-        kind: &'static str,
+        kind: String,
         call_id: String,
         output: String,
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ResponseInputContent {
+    Text(String),
+    Parts(Vec<ResponseContentPart>),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum ResponseContentPart {
     #[serde(rename = "input_text")]
     InputText { text: String },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseTool {
     #[serde(rename = "type")]
-    pub kind: &'static str,
+    pub kind: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub parameters: Value,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ResponseToolChoice {
     Mode(String),
     Named(ResponseToolChoiceNamed),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseToolChoiceNamed {
     #[serde(rename = "type")]
-    pub kind: &'static str,
+    pub kind: String,
     pub name: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponsesApiResponse {
     pub id: String,
     pub created_at: Option<u64>,
@@ -90,7 +98,7 @@ pub struct ResponsesApiResponse {
     pub incomplete_details: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseOutputItem {
     pub id: Option<String>,
     #[serde(rename = "type")]
@@ -107,7 +115,7 @@ pub struct ResponseOutputItem {
     pub call_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseOutputContentPart {
     #[serde(rename = "type")]
     pub kind: String,
@@ -115,7 +123,7 @@ pub struct ResponseOutputContentPart {
     pub text: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseUsage {
     #[serde(default)]
     pub input_tokens: u32,
@@ -125,20 +133,22 @@ pub struct ResponseUsage {
     pub total_tokens: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponsesStreamEvent {
     #[serde(rename = "type")]
     pub event_type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<ResponsesApiResponse>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_index: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_index: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delta: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item: Option<ResponseOutputItem>,
 }
